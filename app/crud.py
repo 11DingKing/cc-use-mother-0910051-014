@@ -8,9 +8,11 @@ from app.models import (
     Session, Assignment, Review, Warning,
     ChangeRequest, ChangeHistory, SessionConflict, RescheduleSuggestion,
     LevelBadge, PointRecord, MonthlyRanking, StaffBadge,
+    Resource, ResourceHold, ResourceHoldItem,
     StaffType, SessionType, SessionStatus, AssignmentRole,
     AudienceType, WarningType, ChangeType, ChangeStatus,
-    ConflictType, RescheduleStatus, PointSourceType
+    ConflictType, RescheduleStatus, PointSourceType,
+    ResourceType, HoldStatus
 )
 from app import schemas
 from app.config import settings
@@ -294,10 +296,12 @@ def create_session(db: Session, session_in: schemas.SessionCreate) -> Session:
 
 
 def update_session(db: Session, session_id: int,
-                   session_in: schemas.SessionUpdate) -> Tuple[Optional[Session], List[str]]:
+                   session_in: schemas.SessionUpdate
+                   ) -> Tuple[Optional[Session], List[str], List[schemas.ResourceConflictItem]]:
+    """更新场次。资源相关字段变更时先验证并暂占新组合，成功后才释放旧组合"""
     db_session = get_session(db, session_id)
     if not db_session:
-        return None, ["场次不存在"]
+        return None, ["场次不存在"], []
 
     old_start = db_session.start_time
     old_end = db_session.end_time
@@ -308,6 +312,38 @@ def update_session(db: Session, session_id: int,
     update_data = session_in.model_dump(exclude_unset=True)
 
     validation_errors = []
+
+    new_start = update_data.get("start_time", db_session.start_time)
+    new_end = update_data.get("end_time", db_session.end_time)
+    new_venue_id = update_data.get("venue_id", db_session.venue_id)
+    new_theme_id = update_data.get("theme_id", db_session.theme_id)
+    new_device_sets = update_data.get("device_sets_needed", db_session.device_sets_needed or 0)
+    new_teaching_aids = update_data.get("teaching_aids_needed", db_session.teaching_aids_needed or 0)
+
+    resource_changed = (
+        new_start != db_session.start_time or
+        new_end != db_session.end_time or
+        new_venue_id != db_session.venue_id or
+        new_theme_id != db_session.theme_id or
+        new_device_sets != (db_session.device_sets_needed or 0) or
+        new_teaching_aids != (db_session.teaching_aids_needed or 0)
+    )
+
+    new_hold = None
+    if resource_changed and db_session.status not in (SessionStatus.CANCELLED, SessionStatus.COMPLETED):
+        demands, unconfigured = derive_session_demands(
+            db, new_venue_id, new_theme_id, new_device_sets, new_teaching_aids,
+            new_start, new_end)
+        if unconfigured:
+            db.rollback()
+            return db_session, [c.message for c in unconfigured], unconfigured
+        # 先暂占新组合（场次自身旧暂占不计入冲突），失败则整体不应用
+        new_hold, errors, conflicts = acquire_resource_hold(
+            db, new_start, new_end, demands,
+            session_id=db_session.id, exclude_session_id=db_session.id)
+        if errors or conflicts:
+            db.rollback()
+            return db_session, errors + [c.message for c in conflicts], conflicts
 
     if "status" in update_data:
         new_status = update_data["status"]
@@ -341,9 +377,49 @@ def update_session(db: Session, session_id: int,
             else:
                 validation_errors.append("人员配置不足，需重新核对排班")
 
+    # 资源暂占联动：取消/完成释放，改期换绑新组合
+    if db_session.status in (SessionStatus.CANCELLED, SessionStatus.COMPLETED) and \
+            old_status not in (SessionStatus.CANCELLED, SessionStatus.COMPLETED):
+        release_session_holds(db, session_id, reason=f"场次{db_session.status.value}")
+        _cancel_pending_changes_of_session(db, session_id)
+    elif new_hold is not None:
+        release_session_holds(db, session_id, reason="改期释放旧组合", exclude_hold_id=new_hold.id)
+        if db_session.status == SessionStatus.SCHEDULED:
+            new_hold.status = HoldStatus.CONFIRMED
+            new_hold.expires_at = None
+        db.flush()
+
+    # 排定时确保资源暂占已确认（暂占过期时重新暂占），失败则整体不应用
+    if db_session.status == SessionStatus.SCHEDULED and old_status != SessionStatus.SCHEDULED:
+        ok, hold_errors, hold_conflicts = ensure_session_holds_confirmed(db, db_session)
+        if not ok:
+            db.rollback()
+            validation_errors.extend(hold_errors)
+            validation_errors.append("资源不足，无法标记为已排定状态")
+            return db_session, validation_errors, hold_conflicts
+
     db.commit()
     db.refresh(db_session)
-    return db_session, validation_errors
+    return db_session, validation_errors, []
+
+
+def _cancel_pending_changes_of_session(db: Session, session_id: int) -> None:
+    """场次取消/完成后，其在途变更自动取消（暂占已由 release_session_holds 释放）"""
+    changes = db.query(ChangeRequest).filter(
+        ChangeRequest.session_id == session_id,
+        ChangeRequest.status.in_([ChangeStatus.PENDING, ChangeStatus.APPROVED])
+    ).all()
+    for change in changes:
+        change.status = ChangeStatus.CANCELLED
+        create_change_history(db, schemas.ChangeHistoryCreate(
+            session_id=session_id,
+            operator="系统",
+            action="变更自动取消",
+            change_request_id=change.id,
+            change_type=change.change_type,
+            description="场次已取消或完成，关联变更自动取消"
+        ))
+    db.flush()
 
 
 def create_assignment(db: Session, session_id: int,
@@ -364,6 +440,7 @@ def create_assignment(db: Session, session_id: int,
     session = db.query(Session).filter(Session.id == session_id).first()
     if is_session_fully_staffed(db, session_id) and session.status == SessionStatus.DRAFT:
         session.status = SessionStatus.SCHEDULED
+        confirm_session_holds(db, session_id)
 
     db.commit()
     db.refresh(db_assignment)
@@ -574,20 +651,540 @@ def get_staff_ranking(db: Session, limit: int = 10) -> List[schemas.StaffRanking
     return sorted(rankings, key=lambda x: (x.star_rating, x.total_service_hours), reverse=True)[:limit]
 
 
+# ============================================================
+# 多资源统一暂占（展厅 / 无线设备套装 / 主题教具）
+# ============================================================
+
+def get_resource(db: Session, resource_id: int) -> Optional[Resource]:
+    return db.query(Resource).filter(Resource.id == resource_id).first()
+
+
+def get_resource_list(db: Session, skip: int = 0, limit: int = 100,
+                      resource_type: Optional[ResourceType] = None,
+                      is_active: Optional[bool] = None) -> List[Resource]:
+    query = db.query(Resource)
+    if resource_type:
+        query = query.filter(Resource.resource_type == resource_type)
+    if is_active is not None:
+        query = query.filter(Resource.is_active == is_active)
+    return query.order_by(Resource.id).offset(skip).limit(limit).all()
+
+
+def create_resource(db: Session, resource_in: schemas.ResourceCreate) -> Resource:
+    db_resource = Resource(**resource_in.model_dump())
+    db.add(db_resource)
+    db.commit()
+    db.refresh(db_resource)
+    return db_resource
+
+
+def update_resource(db: Session, resource_id: int,
+                    resource_in: schemas.ResourceUpdate) -> Optional[Resource]:
+    db_resource = get_resource(db, resource_id)
+    if not db_resource:
+        return None
+    update_data = resource_in.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(db_resource, field, value)
+    db.commit()
+    db.refresh(db_resource)
+    return db_resource
+
+
+def get_hold(db: Session, hold_id: int) -> Optional[ResourceHold]:
+    return db.query(ResourceHold).options(
+        joinedload(ResourceHold.items).joinedload(ResourceHoldItem.resource)
+    ).filter(ResourceHold.id == hold_id).first()
+
+
+def get_hold_list(db: Session, skip: int = 0, limit: int = 100,
+                  session_id: Optional[int] = None,
+                  change_request_id: Optional[int] = None,
+                  status: Optional[HoldStatus] = None) -> List[ResourceHold]:
+    query = db.query(ResourceHold).options(
+        joinedload(ResourceHold.items).joinedload(ResourceHoldItem.resource)
+    )
+    if session_id:
+        query = query.filter(ResourceHold.session_id == session_id)
+    if change_request_id:
+        query = query.filter(ResourceHold.change_request_id == change_request_id)
+    if status:
+        query = query.filter(ResourceHold.status == status)
+    return query.order_by(ResourceHold.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def _expire_overdue_holds(db: Session, now: Optional[datetime] = None) -> int:
+    """把超时未确认的暂占标记为已过期（惰性清理，随容量核算一起执行）"""
+    now = now or datetime.now()
+    return db.query(ResourceHold).filter(
+        ResourceHold.status == HoldStatus.HELD,
+        ResourceHold.expires_at.isnot(None),
+        ResourceHold.expires_at <= now
+    ).update({ResourceHold.status: HoldStatus.EXPIRED}, synchronize_session=False)
+
+
+def cleanup_expired_holds(db: Session) -> int:
+    """清理超时暂占并提交。服务启动时调用，保证重启后过期暂占不占容量"""
+    count = _expire_overdue_holds(db)
+    db.commit()
+    return count
+
+
+def _merge_demands(demands) -> dict:
+    """合并同一资源的多条需求并过滤非正数量，返回 {resource_id: quantity}"""
+    merged = {}
+    for d in demands or []:
+        resource_id = d.get("resource_id") if isinstance(d, dict) else getattr(d, "resource_id", None)
+        quantity = d.get("quantity") if isinstance(d, dict) else getattr(d, "quantity", 0)
+        if resource_id is None or not quantity or quantity <= 0:
+            continue
+        merged[resource_id] = merged.get(resource_id, 0) + quantity
+    return merged
+
+
+def _query_overlapping_holders(db: Session, resource_id: int, start_time: datetime,
+                               end_time: datetime, now: datetime,
+                               exclude_session_id: Optional[int] = None,
+                               exclude_change_request_id: Optional[int] = None) -> List[dict]:
+    """查询某资源在指定时段内的有效占用（暂占中未过期 + 已确认）"""
+    query = db.query(ResourceHold, ResourceHoldItem.quantity, Session.title).join(
+        ResourceHoldItem, ResourceHoldItem.hold_id == ResourceHold.id
+    ).outerjoin(
+        Session, ResourceHold.session_id == Session.id
+    ).filter(
+        ResourceHoldItem.resource_id == resource_id,
+        ResourceHold.status.in_([HoldStatus.HELD, HoldStatus.CONFIRMED]),
+        ResourceHold.start_time < end_time,
+        ResourceHold.end_time > start_time,
+        or_(
+            ResourceHold.status == HoldStatus.CONFIRMED,
+            ResourceHold.expires_at.is_(None),
+            ResourceHold.expires_at > now
+        )
+    )
+    if exclude_session_id is not None:
+        query = query.filter(or_(ResourceHold.session_id.is_(None),
+                                 ResourceHold.session_id != exclude_session_id))
+    if exclude_change_request_id is not None:
+        query = query.filter(or_(ResourceHold.change_request_id.is_(None),
+                                 ResourceHold.change_request_id != exclude_change_request_id))
+
+    holders = []
+    for hold, quantity, session_title in query.all():
+        holders.append({
+            "hold_id": hold.id,
+            "session_id": hold.session_id,
+            "session_title": session_title,
+            "change_request_id": hold.change_request_id,
+            "quantity": quantity,
+            "status": hold.status,
+            "start_time": hold.start_time,
+            "end_time": hold.end_time
+        })
+    return holders
+
+
+def _build_resource_conflict(resource: Resource, start_time: datetime, end_time: datetime,
+                             needed: int, available: int, holders: List[dict]
+                             ) -> schemas.ResourceConflictItem:
+    return schemas.ResourceConflictItem(
+        resource_id=resource.id,
+        resource_name=resource.name,
+        resource_type=resource.resource_type,
+        start_time=start_time,
+        end_time=end_time,
+        required_quantity=needed,
+        available_quantity=max(0, available),
+        total_quantity=resource.total_quantity,
+        holders=[schemas.ResourceHolderInfo(**h) for h in holders],
+        message=(f"资源「{resource.name}」（{resource.resource_type.value}）在 "
+                 f"{start_time} - {end_time} 时段不足：需要 {needed}，"
+                 f"可用 {max(0, available)}/{resource.total_quantity}")
+    )
+
+
+def _unconfigured_resource_conflict(resource_type: ResourceType, needed: int,
+                                    start_time: Optional[datetime],
+                                    end_time: Optional[datetime]) -> schemas.ResourceConflictItem:
+    return schemas.ResourceConflictItem(
+        resource_id=None,
+        resource_name=resource_type.value,
+        resource_type=resource_type,
+        start_time=start_time,
+        end_time=end_time,
+        required_quantity=needed,
+        available_quantity=0,
+        total_quantity=0,
+        holders=[],
+        message=f"未配置可用的{resource_type.value}资源，无法满足需求 {needed}"
+    )
+
+
+def check_resource_availability(db: Session, demands, start_time: datetime, end_time: datetime,
+                                exclude_session_id: Optional[int] = None,
+                                exclude_change_request_id: Optional[int] = None
+                                ) -> List[schemas.ResourceConflictItem]:
+    """只读校验：任一资源不足时返回完整冲突集合，不产生任何占用"""
+    now = datetime.now()
+    _expire_overdue_holds(db, now)
+    merged = _merge_demands(demands)
+    conflicts = []
+    if not merged:
+        return conflicts
+
+    resources = {r.id: r for r in db.query(Resource).filter(Resource.id.in_(sorted(merged))).all()}
+    for resource_id in sorted(merged):
+        resource = resources.get(resource_id)
+        if not resource or not resource.is_active:
+            continue
+        needed = merged[resource_id]
+        holders = _query_overlapping_holders(db, resource_id, start_time, end_time, now,
+                                             exclude_session_id=exclude_session_id,
+                                             exclude_change_request_id=exclude_change_request_id)
+        used = sum(h["quantity"] for h in holders)
+        available = resource.total_quantity - used
+        if needed > available:
+            conflicts.append(_build_resource_conflict(resource, start_time, end_time,
+                                                      needed, available, holders))
+    return conflicts
+
+
+def acquire_resource_hold(db: Session, start_time: datetime, end_time: datetime, demands,
+                          session_id: Optional[int] = None,
+                          change_request_id: Optional[int] = None,
+                          exclude_session_id: Optional[int] = None,
+                          exclude_change_request_id: Optional[int] = None,
+                          ttl_minutes: Optional[int] = None,
+                          created_by: Optional[str] = None
+                          ) -> Tuple[Optional[ResourceHold], List[str], List[schemas.ResourceConflictItem]]:
+    """统一多资源暂占：任一资源不足则全部不占，返回可解释冲突集合。
+
+    先按固定顺序锁定资源行（version+1 写锁），再核算容量并写入暂占，
+    三者处于同一事务，保证并发场次下"检查+占用"原子完成、容量不超卖。
+    调用方负责提交或回滚事务；失败时不产生任何暂占记录。
+    """
+    merged = _merge_demands(demands)
+    if not merged:
+        return None, [], []
+    if not start_time or not end_time or start_time >= end_time:
+        return None, ["暂占时间段无效"], []
+
+    if exclude_session_id is None:
+        exclude_session_id = session_id
+    if exclude_change_request_id is None:
+        exclude_change_request_id = change_request_id
+
+    db.flush()
+    resource_ids = sorted(merged)
+    db.query(Resource).filter(Resource.id.in_(resource_ids)).update(
+        {Resource.version: Resource.version + 1}, synchronize_session=False)
+
+    now = datetime.now()
+    _expire_overdue_holds(db, now)
+
+    resources = {r.id: r for r in db.query(Resource).filter(Resource.id.in_(resource_ids)).all()}
+    errors = []
+    for resource_id in resource_ids:
+        resource = resources.get(resource_id)
+        if not resource:
+            errors.append(f"资源 {resource_id} 不存在")
+        elif not resource.is_active:
+            errors.append(f"资源「{resource.name}」已停用")
+    if errors:
+        return None, errors, []
+
+    conflicts = []
+    for resource_id in resource_ids:
+        resource = resources[resource_id]
+        needed = merged[resource_id]
+        holders = _query_overlapping_holders(db, resource_id, start_time, end_time, now,
+                                             exclude_session_id=exclude_session_id,
+                                             exclude_change_request_id=exclude_change_request_id)
+        used = sum(h["quantity"] for h in holders)
+        available = resource.total_quantity - used
+        if needed > available:
+            conflicts.append(_build_resource_conflict(resource, start_time, end_time,
+                                                      needed, available, holders))
+    if conflicts:
+        return None, [], conflicts
+
+    ttl = ttl_minutes if ttl_minutes is not None else settings.RESOURCE_HOLD_TTL_MINUTES
+    hold = ResourceHold(
+        session_id=session_id,
+        change_request_id=change_request_id,
+        status=HoldStatus.HELD,
+        start_time=start_time,
+        end_time=end_time,
+        expires_at=now + timedelta(minutes=ttl) if ttl and ttl > 0 else None,
+        created_by=created_by
+    )
+    db.add(hold)
+    db.flush()
+    for resource_id in resource_ids:
+        db.add(ResourceHoldItem(hold_id=hold.id, resource_id=resource_id,
+                                quantity=merged[resource_id]))
+    db.flush()
+    return hold, [], []
+
+
+def confirm_resource_hold(db: Session, hold_id: int) -> Tuple[bool, List[str]]:
+    """确认暂占（审批/排定）。幂等：已确认的暂占重复确认不产生额外占用"""
+    hold = db.query(ResourceHold).filter(ResourceHold.id == hold_id).first()
+    if not hold:
+        return False, ["暂占记录不存在"]
+    if hold.status == HoldStatus.CONFIRMED:
+        return True, []
+    if hold.status != HoldStatus.HELD:
+        return False, [f"暂占状态为{hold.status.value}，无法确认"]
+    hold.status = HoldStatus.CONFIRMED
+    hold.expires_at = None
+    db.flush()
+    return True, []
+
+
+def confirm_session_holds(db: Session, session_id: int) -> int:
+    """确认场次所有暂占中的资源（场次排定时调用）"""
+    holds = db.query(ResourceHold).filter(
+        ResourceHold.session_id == session_id,
+        ResourceHold.status == HoldStatus.HELD
+    ).all()
+    for hold in holds:
+        hold.status = HoldStatus.CONFIRMED
+        hold.expires_at = None
+    db.flush()
+    return len(holds)
+
+
+def release_resource_hold(db: Session, hold_id: int,
+                          reason: Optional[str] = None) -> Tuple[bool, List[str]]:
+    """释放暂占（取消/拒绝/改期）。幂等：已释放或已过期的暂占重复释放无副作用"""
+    hold = db.query(ResourceHold).filter(ResourceHold.id == hold_id).first()
+    if not hold:
+        return False, ["暂占记录不存在"]
+    if hold.status in (HoldStatus.RELEASED, HoldStatus.EXPIRED):
+        return True, []
+    hold.status = HoldStatus.RELEASED
+    hold.released_at = datetime.now()
+    hold.release_reason = reason
+    db.flush()
+    return True, []
+
+
+def _active_holds_of_session(db: Session, session_id: int) -> List[ResourceHold]:
+    """场次自身及其在途变更（待审核/已通过）持有的全部有效暂占"""
+    active_change_ids = [row.id for row in db.query(ChangeRequest.id).filter(
+        ChangeRequest.session_id == session_id,
+        ChangeRequest.status.in_([ChangeStatus.PENDING, ChangeStatus.APPROVED])
+    ).all()]
+    conditions = [ResourceHold.session_id == session_id]
+    if active_change_ids:
+        conditions.append(ResourceHold.change_request_id.in_(active_change_ids))
+    return db.query(ResourceHold).filter(
+        ResourceHold.status.in_([HoldStatus.HELD, HoldStatus.CONFIRMED]),
+        or_(*conditions)
+    ).all()
+
+
+def release_session_holds(db: Session, session_id: int, reason: Optional[str] = None,
+                          exclude_hold_id: Optional[int] = None) -> int:
+    """释放场次及其在途变更的全部有效暂占（场次取消/完成/改期时调用）"""
+    now = datetime.now()
+    count = 0
+    for hold in _active_holds_of_session(db, session_id):
+        if exclude_hold_id and hold.id == exclude_hold_id:
+            continue
+        hold.status = HoldStatus.RELEASED
+        hold.released_at = now
+        hold.release_reason = reason
+        count += 1
+    db.flush()
+    return count
+
+
+def release_change_holds(db: Session, change_request_id: int,
+                         reason: Optional[str] = None) -> int:
+    """释放变更申请持有的全部有效暂占（审核拒绝/取消时调用）"""
+    now = datetime.now()
+    holds = db.query(ResourceHold).filter(
+        ResourceHold.change_request_id == change_request_id,
+        ResourceHold.status.in_([HoldStatus.HELD, HoldStatus.CONFIRMED])
+    ).all()
+    for hold in holds:
+        hold.status = HoldStatus.RELEASED
+        hold.released_at = now
+        hold.release_reason = reason
+    db.flush()
+    return len(holds)
+
+
+def get_resource_availability(db: Session, resource_id: int, start_time: datetime,
+                              end_time: datetime) -> Optional[schemas.ResourceAvailability]:
+    resource = get_resource(db, resource_id)
+    if not resource:
+        return None
+    now = datetime.now()
+    holders = _query_overlapping_holders(db, resource_id, start_time, end_time, now)
+    used = sum(h["quantity"] for h in holders)
+    return schemas.ResourceAvailability(
+        resource_id=resource.id,
+        resource_name=resource.name,
+        resource_type=resource.resource_type,
+        start_time=start_time,
+        end_time=end_time,
+        total_quantity=resource.total_quantity,
+        held_quantity=used,
+        available_quantity=max(0, resource.total_quantity - used),
+        holders=[schemas.ResourceHolderInfo(**h) for h in holders]
+    )
+
+
+def derive_session_demands(db: Session, venue_id: int, theme_id: int,
+                           device_sets_needed: int, teaching_aids_needed: int,
+                           start_time: Optional[datetime] = None,
+                           end_time: Optional[datetime] = None
+                           ) -> Tuple[List[dict], List[schemas.ResourceConflictItem]]:
+    """推导场次资源需求：展厅按场地关联，设备套装/主题教具按数量匹配资源池。
+
+    场地未登记展厅资源时不产生需求（兼容旧数据）；显式填写了设备/教具
+    需求但没有可用资源池时，返回"未配置"冲突。
+    """
+    demands = []
+    conflicts = []
+
+    venue_resource = db.query(Resource).filter(
+        Resource.resource_type == ResourceType.VENUE,
+        Resource.venue_id == venue_id,
+        Resource.is_active == True
+    ).first()
+    if venue_resource:
+        demands.append({"resource_id": venue_resource.id, "quantity": 1})
+
+    if device_sets_needed and device_sets_needed > 0:
+        device_resource = db.query(Resource).filter(
+            Resource.resource_type == ResourceType.DEVICE_SET,
+            Resource.is_active == True
+        ).order_by(Resource.id).first()
+        if device_resource:
+            demands.append({"resource_id": device_resource.id, "quantity": device_sets_needed})
+        else:
+            conflicts.append(_unconfigured_resource_conflict(
+                ResourceType.DEVICE_SET, device_sets_needed, start_time, end_time))
+
+    if teaching_aids_needed and teaching_aids_needed > 0:
+        aid_resource = db.query(Resource).filter(
+            Resource.resource_type == ResourceType.TEACHING_AID,
+            Resource.theme_id == theme_id,
+            Resource.is_active == True
+        ).order_by(Resource.id).first()
+        if aid_resource:
+            demands.append({"resource_id": aid_resource.id, "quantity": teaching_aids_needed})
+        else:
+            conflicts.append(_unconfigured_resource_conflict(
+                ResourceType.TEACHING_AID, teaching_aids_needed, start_time, end_time))
+
+    return demands, conflicts
+
+
+def ensure_session_holds_confirmed(db: Session, session: Session
+                                   ) -> Tuple[bool, List[str], List[schemas.ResourceConflictItem]]:
+    """排定时确保场次资源已确认：已有暂占则确认，缺失则重新暂占后确认"""
+    demands, unconfigured = derive_session_demands(
+        db, session.venue_id, session.theme_id,
+        session.device_sets_needed or 0, session.teaching_aids_needed or 0,
+        session.start_time, session.end_time)
+    if unconfigured:
+        return False, [c.message for c in unconfigured], unconfigured
+
+    _expire_overdue_holds(db)
+    active_holds = db.query(ResourceHold).filter(
+        ResourceHold.session_id == session.id,
+        ResourceHold.status.in_([HoldStatus.HELD, HoldStatus.CONFIRMED])
+    ).all()
+    if active_holds:
+        for hold in active_holds:
+            if hold.status == HoldStatus.HELD:
+                hold.status = HoldStatus.CONFIRMED
+                hold.expires_at = None
+        db.flush()
+        return True, [], []
+
+    if not demands:
+        return True, [], []
+
+    hold, errors, conflicts = acquire_resource_hold(
+        db, session.start_time, session.end_time, demands,
+        session_id=session.id, exclude_session_id=session.id)
+    if errors or conflicts:
+        return False, errors + [c.message for c in conflicts], conflicts
+    hold.status = HoldStatus.CONFIRMED
+    hold.expires_at = None
+    db.flush()
+    return True, [], []
+
+
+def create_session_with_holds(db: Session, session_in: schemas.SessionCreate
+                              ) -> Tuple[Optional[Session], List[str], List[schemas.ResourceConflictItem]]:
+    """创建场次（草稿）并按时间段暂占所需资源；任一资源不足则整体失败"""
+    demands, unconfigured = derive_session_demands(
+        db, session_in.venue_id, session_in.theme_id,
+        session_in.device_sets_needed, session_in.teaching_aids_needed,
+        session_in.start_time, session_in.end_time)
+    if unconfigured:
+        return None, [c.message for c in unconfigured], unconfigured
+
+    db_session = Session(**session_in.model_dump())
+    db.add(db_session)
+    db.flush()
+
+    hold, errors, conflicts = acquire_resource_hold(
+        db, session_in.start_time, session_in.end_time, demands,
+        session_id=db_session.id)
+    if errors or conflicts:
+        db.rollback()
+        return None, errors + [c.message for c in conflicts], conflicts
+
+    db.commit()
+    db.refresh(db_session)
+    return db_session, [], []
+
+
 def create_change_request(db: Session, change_in: schemas.ChangeRequestCreate) -> Tuple[Optional[ChangeRequest], List[str]]:
+    change, errors, _ = submit_change_request(db, change_in)
+    return change, errors
+
+
+def submit_change_request(db: Session, change_in: schemas.ChangeRequestCreate
+                          ) -> Tuple[Optional[ChangeRequest], List[str], List[schemas.ResourceConflictItem]]:
+    """提交变更申请（变更预审）：按新组合暂占资源，任一不足则整体拒绝并返回冲突集合"""
     session = get_session(db, change_in.session_id)
     if not session:
-        return None, ["场次不存在"]
+        return None, ["场次不存在"], []
 
     if session.status == SessionStatus.COMPLETED:
-        return None, ["已完成的场次不能申请变更"]
+        return None, ["已完成的场次不能申请变更"], []
+
+    if session.status == SessionStatus.CANCELLED:
+        return None, ["已取消的场次不能申请变更"], []
 
     pending_request = db.query(ChangeRequest).filter(
         ChangeRequest.session_id == change_in.session_id,
         ChangeRequest.status.in_([ChangeStatus.PENDING, ChangeStatus.APPROVED])
     ).first()
     if pending_request:
-        return None, ["该场次已有待处理或已通过的变更申请"]
+        return None, ["该场次已有待处理或已通过的变更申请"], []
+
+    new_start = change_in.new_start_time or session.start_time
+    new_end = change_in.new_end_time or session.end_time
+    new_device_sets = change_in.new_device_sets_needed \
+        if change_in.new_device_sets_needed is not None else (session.device_sets_needed or 0)
+    new_teaching_aids = change_in.new_teaching_aids_needed \
+        if change_in.new_teaching_aids_needed is not None else (session.teaching_aids_needed or 0)
+
+    demands, unconfigured = derive_session_demands(
+        db, session.venue_id, session.theme_id, new_device_sets, new_teaching_aids,
+        new_start, new_end)
+    if unconfigured:
+        return None, [c.message for c in unconfigured], unconfigured
 
     db_change = ChangeRequest(
         session_id=change_in.session_id,
@@ -597,15 +1194,30 @@ def create_change_request(db: Session, change_in: schemas.ChangeRequestCreate) -
         old_end_time=session.end_time,
         old_audience_count=session.audience_count,
         old_guides_needed=session.guides_needed,
+        old_device_sets_needed=session.device_sets_needed,
+        old_teaching_aids_needed=session.teaching_aids_needed,
         new_start_time=change_in.new_start_time,
         new_end_time=change_in.new_end_time,
         new_audience_count=change_in.new_audience_count,
         new_guides_needed=change_in.new_guides_needed,
+        new_device_sets_needed=change_in.new_device_sets_needed,
+        new_teaching_aids_needed=change_in.new_teaching_aids_needed,
         reason=change_in.reason,
         status=ChangeStatus.PENDING
     )
     db.add(db_change)
     db.flush()
+
+    # 预审暂占新组合；场次自身的旧组合暂占不计入冲突
+    hold, errors, conflicts = acquire_resource_hold(
+        db, new_start, new_end, demands,
+        change_request_id=db_change.id,
+        exclude_session_id=session.id,
+        exclude_change_request_id=db_change.id,
+        created_by=change_in.requester)
+    if errors or conflicts:
+        db.rollback()
+        return None, errors + [c.message for c in conflicts], conflicts
 
     create_change_history(db, schemas.ChangeHistoryCreate(
         session_id=change_in.session_id,
@@ -618,7 +1230,7 @@ def create_change_request(db: Session, change_in: schemas.ChangeRequestCreate) -
 
     db.commit()
     db.refresh(db_change)
-    return db_change, []
+    return db_change, [], []
 
 
 def get_change_request(db: Session, change_id: int) -> Optional[ChangeRequest]:
@@ -647,12 +1259,76 @@ def get_change_request_list(db: Session, skip: int = 0, limit: int = 100,
 
 def review_change_request(db: Session, change_id: int,
                           review_in: schemas.ChangeRequestReview) -> Tuple[Optional[ChangeRequest], List[str]]:
+    change, errors, _ = perform_change_review(db, change_id, review_in)
+    return change, errors
+
+
+def _ensure_change_hold_confirmed(db: Session, change: ChangeRequest
+                                  ) -> Tuple[bool, List[str], List[schemas.ResourceConflictItem]]:
+    """审批通过时确认变更的资源暂占；暂占已过期或缺失则按新组合重新暂占后确认"""
+    session = change.session
+    if not session:
+        return False, ["关联场次不存在"], []
+
+    new_start = change.new_start_time or session.start_time
+    new_end = change.new_end_time or session.end_time
+    new_device_sets = change.new_device_sets_needed \
+        if change.new_device_sets_needed is not None else (session.device_sets_needed or 0)
+    new_teaching_aids = change.new_teaching_aids_needed \
+        if change.new_teaching_aids_needed is not None else (session.teaching_aids_needed or 0)
+
+    demands, unconfigured = derive_session_demands(
+        db, session.venue_id, session.theme_id, new_device_sets, new_teaching_aids,
+        new_start, new_end)
+    if unconfigured:
+        return False, [c.message for c in unconfigured], unconfigured
+
+    _expire_overdue_holds(db)
+    hold = db.query(ResourceHold).filter(
+        ResourceHold.change_request_id == change.id,
+        ResourceHold.status.in_([HoldStatus.HELD, HoldStatus.CONFIRMED])
+    ).first()
+    if hold:
+        if hold.status == HoldStatus.HELD:
+            hold.status = HoldStatus.CONFIRMED
+            hold.expires_at = None
+            db.flush()
+        return True, [], []
+
+    if not demands:
+        return True, [], []
+
+    hold, errors, conflicts = acquire_resource_hold(
+        db, new_start, new_end, demands,
+        change_request_id=change.id,
+        exclude_session_id=session.id,
+        exclude_change_request_id=change.id)
+    if errors or conflicts:
+        return False, errors + [c.message for c in conflicts], conflicts
+    hold.status = HoldStatus.CONFIRMED
+    hold.expires_at = None
+    db.flush()
+    return True, [], []
+
+
+def perform_change_review(db: Session, change_id: int,
+                          review_in: schemas.ChangeRequestReview
+                          ) -> Tuple[Optional[ChangeRequest], List[str], List[schemas.ResourceConflictItem]]:
+    """审核变更：通过时确认资源暂占（不足则审核失败），拒绝时释放暂占"""
     change = get_change_request(db, change_id)
     if not change:
-        return None, ["变更申请不存在"]
+        return None, ["变更申请不存在"], []
 
     if change.status != ChangeStatus.PENDING:
-        return None, [f"当前状态为{change.status.value}，无法审核"]
+        return None, [f"当前状态为{change.status.value}，无法审核"], []
+
+    if review_in.status == ChangeStatus.APPROVED:
+        ok, hold_errors, hold_conflicts = _ensure_change_hold_confirmed(db, change)
+        if not ok:
+            db.rollback()
+            return None, hold_errors, hold_conflicts
+    elif review_in.status == ChangeStatus.REJECTED:
+        release_change_holds(db, change.id, reason="审核拒绝")
 
     change.status = review_in.status
     change.reviewer = review_in.reviewer
@@ -676,6 +1352,36 @@ def review_change_request(db: Session, change_id: int,
                 db.add(conflict)
             for suggestion in suggestions:
                 db.add(suggestion)
+
+    db.commit()
+    db.refresh(change)
+    return change, [], []
+
+
+def cancel_change_request(db: Session, change_id: int,
+                          operator: str) -> Tuple[Optional[ChangeRequest], List[str]]:
+    """取消变更申请并释放其资源暂占。重复取消幂等"""
+    change = get_change_request(db, change_id)
+    if not change:
+        return None, ["变更申请不存在"]
+
+    if change.status == ChangeStatus.CANCELLED:
+        return change, []
+
+    if change.status not in (ChangeStatus.PENDING, ChangeStatus.APPROVED):
+        return None, [f"当前状态为{change.status.value}，无法取消"]
+
+    release_change_holds(db, change.id, reason="变更取消")
+    change.status = ChangeStatus.CANCELLED
+
+    create_change_history(db, schemas.ChangeHistoryCreate(
+        session_id=change.session_id,
+        operator=operator,
+        action="取消变更",
+        change_request_id=change.id,
+        change_type=change.change_type,
+        description="取消变更申请，已释放资源暂占"
+    ))
 
     db.commit()
     db.refresh(change)
@@ -790,6 +1496,51 @@ def execute_change_request(db: Session, change_id: int, operator: str) -> schema
             errors=["关联场次不存在"]
         )
 
+    # 资源保障：先确保新组合暂占有效，验证成功后才释放旧组合
+    new_start = change.new_start_time or session.start_time
+    new_end = change.new_end_time or session.end_time
+    new_device_sets = change.new_device_sets_needed \
+        if change.new_device_sets_needed is not None else (session.device_sets_needed or 0)
+    new_teaching_aids = change.new_teaching_aids_needed \
+        if change.new_teaching_aids_needed is not None else (session.teaching_aids_needed or 0)
+
+    demands, unconfigured = derive_session_demands(
+        db, session.venue_id, session.theme_id, new_device_sets, new_teaching_aids,
+        new_start, new_end)
+    if unconfigured:
+        return schemas.ChangeExecuteResult(
+            success=False,
+            message="所需资源未配置，变更未执行",
+            errors=[c.message for c in unconfigured],
+            resource_conflicts=unconfigured
+        )
+
+    _expire_overdue_holds(db)
+    change_hold = db.query(ResourceHold).filter(
+        ResourceHold.change_request_id == change.id,
+        ResourceHold.status.in_([HoldStatus.HELD, HoldStatus.CONFIRMED])
+    ).first()
+    if demands and not change_hold:
+        change_hold, hold_errors, hold_conflicts = acquire_resource_hold(
+            db, new_start, new_end, demands,
+            change_request_id=change.id,
+            exclude_session_id=session.id,
+            exclude_change_request_id=change.id)
+        if hold_errors or hold_conflicts:
+            db.rollback()
+            return schemas.ChangeExecuteResult(
+                success=False,
+                message="资源不足，变更未执行",
+                errors=hold_errors + [c.message for c in hold_conflicts],
+                resource_conflicts=hold_conflicts
+            )
+    if change_hold:
+        if change_hold.status == HoldStatus.HELD:
+            change_hold.status = HoldStatus.CONFIRMED
+            change_hold.expires_at = None
+        change_hold.session_id = session.id
+        db.flush()
+
     errors = []
     applied_suggestions = 0
 
@@ -797,7 +1548,9 @@ def execute_change_request(db: Session, change_id: int, operator: str) -> schema
         "start_time": session.start_time.isoformat(),
         "end_time": session.end_time.isoformat(),
         "audience_count": session.audience_count,
-        "guides_needed": session.guides_needed
+        "guides_needed": session.guides_needed,
+        "device_sets_needed": session.device_sets_needed,
+        "teaching_aids_needed": session.teaching_aids_needed
     }
 
     if change.new_start_time:
@@ -808,6 +1561,14 @@ def execute_change_request(db: Session, change_id: int, operator: str) -> schema
         session.audience_count = change.new_audience_count
     if change.new_guides_needed is not None:
         session.guides_needed = change.new_guides_needed
+    if change.new_device_sets_needed is not None:
+        session.device_sets_needed = change.new_device_sets_needed
+    if change.new_teaching_aids_needed is not None:
+        session.teaching_aids_needed = change.new_teaching_aids_needed
+
+    # 新组合已确认有效，释放场次旧组合暂占（保留本次变更转入的暂占）
+    release_session_holds(db, session.id, reason="变更执行，释放旧组合",
+                          exclude_hold_id=change_hold.id if change_hold else None)
 
     pending_conflicts = [c for c in change.conflicts if c.status == RescheduleStatus.PENDING]
     for conflict in pending_conflicts:
@@ -876,7 +1637,9 @@ def execute_change_request(db: Session, change_id: int, operator: str) -> schema
         "start_time": session.start_time.isoformat(),
         "end_time": session.end_time.isoformat(),
         "audience_count": session.audience_count,
-        "guides_needed": session.guides_needed
+        "guides_needed": session.guides_needed,
+        "device_sets_needed": session.device_sets_needed,
+        "teaching_aids_needed": session.teaching_aids_needed
     }
 
     create_change_history(db, schemas.ChangeHistoryCreate(
@@ -1523,6 +2286,7 @@ def create_review(db: Session, review_in: schemas.ReviewCreate) -> Review:
 
         if session.status != SessionStatus.COMPLETED:
             session.status = SessionStatus.COMPLETED
+            release_session_holds(db, session.id, reason="场次完成")
 
     db.commit()
     db.refresh(db_review)

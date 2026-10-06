@@ -23,10 +23,14 @@ def _convert_change_request_to_schema(change, db: Session):
         old_end_time=change.old_end_time,
         old_audience_count=change.old_audience_count,
         old_guides_needed=change.old_guides_needed,
+        old_device_sets_needed=change.old_device_sets_needed,
+        old_teaching_aids_needed=change.old_teaching_aids_needed,
         new_start_time=change.new_start_time,
         new_end_time=change.new_end_time,
         new_audience_count=change.new_audience_count,
         new_guides_needed=change.new_guides_needed,
+        new_device_sets_needed=change.new_device_sets_needed,
+        new_teaching_aids_needed=change.new_teaching_aids_needed,
         reason=change.reason,
         status=change.status,
         reviewer=change.reviewer,
@@ -130,11 +134,16 @@ def create_change_request(
 ):
     """提交变更申请（学校端发起）
 
-    自动记录变更前后的快照数据，防止重复申请
+    自动记录变更前后的快照数据，防止重复申请；
+    变更预审阶段按新组合暂占展厅/设备/教具资源，
+    任一资源不足时整体拒绝并返回可解释的冲突集合
     """
-    change, errors = crud.create_change_request(db, change_in)
+    change, errors, conflicts = crud.submit_change_request(db, change_in)
     if not change:
-        raise HTTPException(status_code=400, detail={"errors": errors})
+        raise HTTPException(status_code=400, detail={
+            "errors": errors,
+            "conflicts": [c.model_dump(mode="json") for c in conflicts]
+        })
     return _convert_change_request_to_schema(change, db)
 
 
@@ -146,21 +155,38 @@ def review_change_request(
 ):
     """审核变更申请
 
-    审核通过时自动触发冲突检测，生成冲突和重排建议
+    审核通过时确认资源暂占（暂占过期则重新校验），资源不足时审核失败；
+    审核拒绝时释放暂占；审核通过自动触发人员冲突检测，生成冲突和重排建议
     """
-    change, errors = crud.review_change_request(db, change_id, review_in)
+    change, errors, conflicts = crud.perform_change_review(db, change_id, review_in)
     if not change:
-        raise HTTPException(status_code=400, detail={"errors": errors})
+        raise HTTPException(status_code=400, detail={
+            "errors": errors,
+            "conflicts": [c.model_dump(mode="json") for c in conflicts]
+        })
 
     base = _convert_change_request_to_schema(change, db)
-    conflicts = [_convert_conflict_to_schema(c) for c in change.conflicts]
+    conflicts_out = [_convert_conflict_to_schema(c) for c in change.conflicts]
     suggestions = [_convert_suggestion_to_schema(s) for s in change.reschedule_suggestions]
 
     return schemas.ChangeRequestWithDetails(
         **base.model_dump(),
-        conflicts=conflicts,
+        conflicts=conflicts_out,
         suggestions=suggestions
     )
+
+
+@router.post("/{change_id}/cancel", response_model=schemas.ChangeRequest)
+def cancel_change_request(
+    change_id: int,
+    operator: str = Body(..., embed=True, description="操作人"),
+    db: Session = Depends(get_db)
+):
+    """取消变更申请并释放其资源暂占（重复取消幂等）"""
+    change, errors = crud.cancel_change_request(db, change_id, operator)
+    if not change:
+        raise HTTPException(status_code=400, detail={"errors": errors})
+    return _convert_change_request_to_schema(change, db)
 
 
 @router.post("/{change_id}/execute", response_model=schemas.ChangeExecuteResult)
@@ -256,15 +282,19 @@ def pre_check_conflicts(
     new_end_time: Optional[str] = Body(None),
     new_audience_count: Optional[int] = Body(None),
     new_guides_needed: Optional[int] = Body(None),
+    new_device_sets_needed: Optional[int] = Body(None),
+    new_teaching_aids_needed: Optional[int] = Body(None),
     db: Session = Depends(get_db)
 ):
-    """预检查变更可能产生的冲突（提交前预览）"""
+    """预检查变更可能产生的冲突（提交前预览，含人员与资源）"""
     from datetime import datetime
     from app.models import ChangeRequest, ChangeType
 
     session = crud.get_session(db, session_id)
     if not session:
         raise HTTPException(status_code=404, detail="场次不存在")
+
+    crud.cleanup_expired_holds(db)
 
     change_type = ChangeType.OTHER
     has_time = new_start_time or new_end_time
@@ -288,6 +318,21 @@ def pre_check_conflicts(
 
     conflicts, suggestions = crud.check_conflicts_and_generate_suggestions(db, temp_change)
 
+    # 资源预检：按新组合核算展厅/设备/教具可用量（只读，不产生暂占）
+    check_start = temp_change.new_start_time or session.start_time
+    check_end = temp_change.new_end_time or session.end_time
+    check_device_sets = new_device_sets_needed \
+        if new_device_sets_needed is not None else (session.device_sets_needed or 0)
+    check_teaching_aids = new_teaching_aids_needed \
+        if new_teaching_aids_needed is not None else (session.teaching_aids_needed or 0)
+
+    demands, unconfigured = crud.derive_session_demands(
+        db, session.venue_id, session.theme_id, check_device_sets, check_teaching_aids,
+        check_start, check_end)
+    resource_conflicts = list(unconfigured)
+    resource_conflicts.extend(crud.check_resource_availability(
+        db, demands, check_start, check_end, exclude_session_id=session_id))
+
     conflict_schemas = [_convert_conflict_to_schema(c) for c in conflicts]
     suggestion_schemas = [_convert_suggestion_to_schema(s) for s in suggestions]
 
@@ -299,7 +344,9 @@ def pre_check_conflicts(
         summary_parts.append(f"检测到 {time_conflicts} 个时间冲突")
     if shortage_conflicts > 0:
         summary_parts.append(f"检测到 {shortage_conflicts} 个人员缺口")
-    if not conflicts:
+    if resource_conflicts:
+        summary_parts.append(f"检测到 {len(resource_conflicts)} 个资源冲突")
+    if not conflicts and not resource_conflicts:
         summary_parts.append("未检测到冲突")
     if suggestions:
         summary_parts.append(f"生成 {len(suggestions)} 条重排建议")
@@ -307,8 +354,9 @@ def pre_check_conflicts(
     summary = "，".join(summary_parts)
 
     return schemas.ConflictCheckResult(
-        has_conflicts=len(conflicts) > 0,
+        has_conflicts=len(conflicts) > 0 or len(resource_conflicts) > 0,
         conflicts=conflict_schemas,
         suggestions=suggestion_schemas,
+        resource_conflicts=resource_conflicts,
         summary=summary
     )

@@ -7,7 +7,7 @@ from app.models import (
     StaffType, SessionType, SessionStatus,
     AssignmentRole, AudienceType, WarningType,
     ChangeType, ChangeStatus, ConflictType, RescheduleStatus,
-    PointSourceType
+    PointSourceType, ResourceType, HoldStatus
 )
 
 
@@ -192,6 +192,8 @@ class SessionBase(BaseModel):
     school_id: Optional[int] = None
     guides_needed: int = 0
     needs_lecturer: bool = False
+    device_sets_needed: int = 0
+    teaching_aids_needed: int = 0
     description: Optional[str] = None
 
 
@@ -211,6 +213,8 @@ class SessionUpdate(BaseModel):
     school_id: Optional[int] = None
     guides_needed: Optional[int] = None
     needs_lecturer: Optional[bool] = None
+    device_sets_needed: Optional[int] = None
+    teaching_aids_needed: Optional[int] = None
     description: Optional[str] = None
     status: Optional[SessionStatus] = None
 
@@ -332,6 +336,8 @@ class ChangeRequestBase(BaseModel):
     new_end_time: Optional[datetime] = None
     new_audience_count: Optional[int] = None
     new_guides_needed: Optional[int] = None
+    new_device_sets_needed: Optional[int] = None
+    new_teaching_aids_needed: Optional[int] = None
     reason: Optional[str] = None
 
 
@@ -351,6 +357,8 @@ class ChangeRequest(ChangeRequestBase):
     old_end_time: Optional[datetime] = None
     old_audience_count: Optional[int] = None
     old_guides_needed: Optional[int] = None
+    old_device_sets_needed: Optional[int] = None
+    old_teaching_aids_needed: Optional[int] = None
     status: ChangeStatus
     reviewer: Optional[str] = None
     review_comment: Optional[str] = None
@@ -452,10 +460,36 @@ class ChangeHistory(ChangeHistoryBase):
         from_attributes = True
 
 
+class ResourceHolderInfo(BaseModel):
+    hold_id: int
+    session_id: Optional[int] = None
+    session_title: Optional[str] = None
+    change_request_id: Optional[int] = None
+    quantity: int
+    status: HoldStatus
+    start_time: datetime
+    end_time: datetime
+
+
+class ResourceConflictItem(BaseModel):
+    """单条资源冲突：可解释地说明哪个资源、哪个时段、差多少、被谁占用"""
+    resource_id: Optional[int] = None
+    resource_name: str
+    resource_type: ResourceType
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    required_quantity: int
+    available_quantity: int
+    total_quantity: int
+    holders: List[ResourceHolderInfo] = []
+    message: str
+
+
 class ConflictCheckResult(BaseModel):
     has_conflicts: bool
     conflicts: List[SessionConflict] = []
     suggestions: List[RescheduleSuggestion] = []
+    resource_conflicts: List[ResourceConflictItem] = []
     summary: str
 
 
@@ -465,6 +499,7 @@ class ChangeExecuteResult(BaseModel):
     applied_suggestions: int = 0
     remaining_conflicts: int = 0
     errors: List[str] = []
+    resource_conflicts: List[ResourceConflictItem] = []
 
 
 class SessionChangeStats(BaseModel):
@@ -485,6 +520,97 @@ class ChangeFrequencyStats(BaseModel):
     approved_count: int
     rejected_count: int
     avg_resolution_time_hours: float
+
+
+class ResourceBase(BaseModel):
+    name: str
+    resource_type: ResourceType
+    total_quantity: int = Field(default=1, ge=1)
+    venue_id: Optional[int] = None
+    theme_id: Optional[int] = None
+    is_active: bool = True
+
+
+class ResourceCreate(ResourceBase):
+    pass
+
+
+class ResourceUpdate(BaseModel):
+    name: Optional[str] = None
+    total_quantity: Optional[int] = Field(default=None, ge=0)
+    venue_id: Optional[int] = None
+    theme_id: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+class Resource(ResourceBase):
+    id: int
+    version: int = 0
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ResourceHoldItemCreate(BaseModel):
+    resource_id: int
+    quantity: int = Field(ge=1)
+
+
+class ResourceHoldCreate(BaseModel):
+    session_id: Optional[int] = None
+    change_request_id: Optional[int] = None
+    start_time: datetime
+    end_time: datetime
+    items: List[ResourceHoldItemCreate]
+    ttl_minutes: Optional[int] = None
+    created_by: Optional[str] = None
+
+
+class ResourceHoldItem(BaseModel):
+    id: int
+    resource_id: int
+    resource_name: str
+    resource_type: ResourceType
+    quantity: int
+
+    class Config:
+        from_attributes = True
+
+
+class ResourceHold(BaseModel):
+    id: int
+    session_id: Optional[int] = None
+    change_request_id: Optional[int] = None
+    status: HoldStatus
+    start_time: datetime
+    end_time: datetime
+    expires_at: Optional[datetime] = None
+    released_at: Optional[datetime] = None
+    release_reason: Optional[str] = None
+    created_by: Optional[str] = None
+    items: List[ResourceHoldItem] = []
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ResourceAvailability(BaseModel):
+    resource_id: int
+    resource_name: str
+    resource_type: ResourceType
+    start_time: datetime
+    end_time: datetime
+    total_quantity: int
+    held_quantity: int
+    available_quantity: int
+    holders: List[ResourceHolderInfo] = []
+
+
+class HoldCleanupResult(BaseModel):
+    expired_count: int
+    message: str
 
 
 ChangeRequestWithDetails.model_rebuild()

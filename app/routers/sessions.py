@@ -40,6 +40,8 @@ def _convert_session_to_schema(session, db: Session):
         school_name=session.school.name if session.school else None,
         guides_needed=session.guides_needed,
         needs_lecturer=session.needs_lecturer,
+        device_sets_needed=session.device_sets_needed or 0,
+        teaching_aids_needed=session.teaching_aids_needed or 0,
         status=session.status,
         description=session.description,
         assignments=assignments,
@@ -77,8 +79,16 @@ def get_session(session_id: int, db: Session = Depends(get_db)):
 
 @router.post("", response_model=schemas.Session)
 def create_session(session_in: schemas.SessionCreate, db: Session = Depends(get_db)):
-    """创建场次"""
-    session = crud.create_session(db, session_in)
+    """创建场次（草稿），按时间段暂占所需展厅/设备/教具资源
+
+    任一资源不足时整体失败并返回可解释的冲突集合，不产生部分占用
+    """
+    session, errors, conflicts = crud.create_session_with_holds(db, session_in)
+    if not session:
+        raise HTTPException(status_code=400, detail={
+            "errors": errors,
+            "conflicts": [c.model_dump(mode="json") for c in conflicts]
+        })
     return _convert_session_to_schema(session, db)
 
 
@@ -88,12 +98,19 @@ def update_session(
     session_in: schemas.SessionUpdate,
     db: Session = Depends(get_db)
 ):
-    """更新场次（时间或人数变动时自动校验排班冲突）"""
-    session, errors = crud.update_session(db, session_id, session_in)
+    """更新场次（时间或人数变动时自动校验排班冲突）
+
+    改期或调整资源需求时，先验证并暂占新组合，成功后才释放旧组合
+    """
+    session, errors, conflicts = crud.update_session(db, session_id, session_in)
     if not session:
         raise HTTPException(status_code=404, detail="场次不存在")
     if errors:
-        raise HTTPException(status_code=400, detail={"message": "更新成功但存在冲突", "errors": errors})
+        raise HTTPException(status_code=400, detail={
+            "message": "更新成功但存在冲突" if not conflicts else "资源不足，未应用修改",
+            "errors": errors,
+            "conflicts": [c.model_dump(mode="json") for c in conflicts]
+        })
     return _convert_session_to_schema(session, db)
 
 

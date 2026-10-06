@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     STARTER_THRESHOLD: int = 5
     WARNING_STAFF_SHORTAGE_THRESHOLD: float = 0.3
 
+    # 资源暂占超时时间（分钟），超时未确认的暂占自动过期释放
+    RESOURCE_HOLD_TTL_MINUTES: int = 60 * 24
+
     class Config:
         env_file = ".env"
 
