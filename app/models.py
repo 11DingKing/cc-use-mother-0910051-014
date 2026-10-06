@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Enum, Text
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Boolean, Enum, Text, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import enum
@@ -64,6 +64,24 @@ class RescheduleStatus(str, enum.Enum):
     IN_PROGRESS = "处理中"
     RESOLVED = "已解决"
     UNRESOLVED = "未解决"
+
+
+class ResourceType(str, enum.Enum):
+    VENUE = "展厅"
+    DEVICE = "无线设备套装"
+    TEACHING_KIT = "主题教具"
+
+
+class HoldStatus(str, enum.Enum):
+    HELD = "暂占中"
+    CONFIRMED = "已确认"
+    RELEASED = "已释放"
+    EXPIRED = "已过期"
+
+
+class HoldPurpose(str, enum.Enum):
+    DRAFT = "草稿暂占"
+    CHANGE_REVIEW = "变更预审暂占"
 
 
 class Staff(Base):
@@ -176,6 +194,8 @@ class Session(Base):
     school_id = Column(Integer, ForeignKey("schools.id"))
     guides_needed = Column(Integer, default=0)
     needs_lecturer = Column(Boolean, default=False)
+    # 沉浸式活动需要同时锁定的无线设备套装数量
+    device_sets_needed = Column(Integer, default=1)
     status = Column(Enum(SessionStatus), default=SessionStatus.DRAFT)
     description = Column(Text)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -188,6 +208,10 @@ class Session(Base):
     reviews = relationship("Review", back_populates="session", cascade="all, delete-orphan")
     change_requests = relationship("ChangeRequest", back_populates="session", cascade="all, delete-orphan")
     change_histories = relationship("ChangeHistory", back_populates="session", cascade="all, delete-orphan")
+    resource_holds = relationship(
+        "ResourceHold", back_populates="session", cascade="all, delete-orphan",
+        foreign_keys="ResourceHold.session_id"
+    )
 
 
 class Assignment(Base):
@@ -251,6 +275,9 @@ class ChangeRequest(Base):
     reviewer = Column(String(100))
     review_comment = Column(Text)
     reviewed_at = Column(DateTime(timezone=True))
+    # 关联的资源暂占组：时间变更时为新获取的预审暂占组；
+    # 仅人数变更时直接借用场次自身已有暂占组（不再重复锁定）
+    resource_group_id = Column(String(36), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -258,6 +285,10 @@ class ChangeRequest(Base):
     conflicts = relationship("SessionConflict", back_populates="change_request", cascade="all, delete-orphan")
     reschedule_suggestions = relationship("RescheduleSuggestion", back_populates="change_request", cascade="all, delete-orphan")
     change_histories = relationship("ChangeHistory", back_populates="change_request", cascade="all, delete-orphan")
+    resource_holds = relationship(
+        "ResourceHold", back_populates="change_request", cascade="all, delete-orphan",
+        foreign_keys="ResourceHold.change_request_id"
+    )
 
 
 class ChangeHistory(Base):
@@ -393,3 +424,58 @@ class StaffBadge(Base):
 
     staff = relationship("Staff", back_populates="badges")
     level_badge = relationship("LevelBadge")
+
+
+class ResourcePool(Base):
+    """资源台账：展厅每个为一个容量1的池，无线设备套装是全局容量池，
+    主题教具按主题各自为一个容量池。"""
+    __tablename__ = "resource_pools"
+
+    id = Column(Integer, primary_key=True, index=True)
+    resource_type = Column(Enum(ResourceType), nullable=False)
+    # 展厅ID / 主题ID；无线设备套装为全局池，取 NULL
+    ref_id = Column(Integer, nullable=True)
+    name = Column(String(100), nullable=False)
+    capacity = Column(Integer, nullable=False, default=1)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    holds = relationship("ResourceHold", back_populates="resource_pool", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("resource_type", "ref_id", name="uq_resource_pool_type_ref"),
+    )
+
+
+class ResourceHold(Base):
+    """多资源暂占单。同一 group_id 的若干行构成一次原子暂占组合：
+    要么全部锁定成功，要么一条都不写入（不产生部分占用泄漏）。"""
+    __tablename__ = "resource_holds"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(String(36), nullable=False, index=True)
+    resource_pool_id = Column(Integer, ForeignKey("resource_pools.id"), nullable=False)
+    resource_type = Column(Enum(ResourceType), nullable=False)
+    resource_name = Column(String(100), nullable=False)
+    session_id = Column(Integer, ForeignKey("sessions.id"), nullable=True)
+    change_request_id = Column(Integer, ForeignKey("change_requests.id"), nullable=True)
+    purpose = Column(Enum(HoldPurpose), nullable=False)
+    status = Column(Enum(HoldStatus), nullable=False, default=HoldStatus.HELD, index=True)
+    quantity = Column(Integer, nullable=False, default=1)
+    start_time = Column(DateTime, nullable=False)
+    end_time = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    confirmed_at = Column(DateTime(timezone=True), nullable=True)
+    released_at = Column(DateTime(timezone=True), nullable=True)
+    released_reason = Column(String(50), nullable=True)
+
+    resource_pool = relationship("ResourcePool", back_populates="holds")
+    session = relationship(
+        "Session", back_populates="resource_holds",
+        foreign_keys=[session_id]
+    )
+    change_request = relationship(
+        "ChangeRequest", back_populates="resource_holds",
+        foreign_keys=[change_request_id]
+    )

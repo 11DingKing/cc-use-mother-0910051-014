@@ -6,6 +6,7 @@ from datetime import datetime
 from app.database import get_db
 from app import schemas, crud
 from app.models import SessionStatus, AssignmentRole
+from app.services.resource_holds import ResourceConflict, get_active_hold_group
 
 router = APIRouter(prefix="/api/sessions", tags=["场次管理"])
 
@@ -24,6 +25,9 @@ def _convert_session_to_schema(session, db: Session):
             created_at=a.created_at
         ))
 
+    active_holds = get_active_hold_group(db, session_id=session.id)
+    resource_group_id = active_holds[0].group_id if active_holds else None
+
     return schemas.Session(
         id=session.id,
         title=session.title,
@@ -40,10 +44,12 @@ def _convert_session_to_schema(session, db: Session):
         school_name=session.school.name if session.school else None,
         guides_needed=session.guides_needed,
         needs_lecturer=session.needs_lecturer,
+        device_sets_needed=session.device_sets_needed or 1,
         status=session.status,
         description=session.description,
         assignments=assignments,
         is_fully_staffed=crud.is_session_fully_staffed(db, session.id),
+        resource_group_id=resource_group_id,
         created_at=session.created_at,
         updated_at=session.updated_at or session.created_at
     )
@@ -77,8 +83,15 @@ def get_session(session_id: int, db: Session = Depends(get_db)):
 
 @router.post("", response_model=schemas.Session)
 def create_session(session_in: schemas.SessionCreate, db: Session = Depends(get_db)):
-    """创建场次"""
-    session = crud.create_session(db, session_in)
+    """创建草稿场次：原子暂占展厅、无线设备套装、主题教具；
+    任一资源不足返回 409 与完整冲突集合，且不占住其余资源。"""
+    try:
+        session = crud.create_session(db, session_in)
+    except ResourceConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": exc.message, "conflicts": exc.conflicts}
+        )
     return _convert_session_to_schema(session, db)
 
 
@@ -88,8 +101,14 @@ def update_session(
     session_in: schemas.SessionUpdate,
     db: Session = Depends(get_db)
 ):
-    """更新场次（时间或人数变动时自动校验排班冲突）"""
-    session, errors = crud.update_session(db, session_id, session_in)
+    """更新场次（改期先锁定新组合再释放旧组合；取消时释放全部暂占）"""
+    try:
+        session, errors = crud.update_session(db, session_id, session_in)
+    except ResourceConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": exc.message, "conflicts": exc.conflicts}
+        )
     if not session:
         raise HTTPException(status_code=404, detail="场次不存在")
     if errors:

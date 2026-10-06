@@ -1,10 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy.orm import Session
 from typing import List, Optional
+from datetime import datetime
 
 from app.database import get_db
 from app import schemas, crud
 from app.models import ChangeStatus, ChangeType, RescheduleStatus
+from app.services import resource_holds
+from app.services.resource_holds import ResourceConflict
 
 router = APIRouter(prefix="/api/changes", tags=["变更管理"])
 
@@ -34,31 +37,33 @@ def _convert_change_request_to_schema(change, db: Session):
         reviewed_at=change.reviewed_at,
         conflict_count=conflict_count,
         suggestion_count=suggestion_count,
+        resource_group_id=change.resource_group_id,
         created_at=change.created_at,
         updated_at=change.updated_at
     )
 
 
 def _convert_conflict_to_schema(conflict):
+    # 预检查产生的临时冲突未落库，id/created_at 等为 None，转换时补占位值
     return schemas.SessionConflict(
-        id=conflict.id,
-        change_request_id=conflict.change_request_id,
+        id=conflict.id or 0,
+        change_request_id=conflict.change_request_id or 0,
         conflict_type=conflict.conflict_type,
         staff_id=conflict.staff_id,
         staff_name=conflict.staff.name if conflict.staff else None,
         assignment_id=conflict.assignment_id,
         message=conflict.message,
         detail=conflict.detail,
-        status=conflict.status,
+        status=conflict.status or RescheduleStatus.PENDING,
         resolved_at=conflict.resolved_at,
-        created_at=conflict.created_at
+        created_at=conflict.created_at or datetime.now()
     )
 
 
 def _convert_suggestion_to_schema(suggestion):
     return schemas.RescheduleSuggestion(
-        id=suggestion.id,
-        change_request_id=suggestion.change_request_id,
+        id=suggestion.id or 0,
+        change_request_id=suggestion.change_request_id or 0,
         conflict_id=suggestion.conflict_id,
         staff_id=suggestion.staff_id,
         staff_name=suggestion.staff.name if suggestion.staff else None,
@@ -67,9 +72,9 @@ def _convert_suggestion_to_schema(suggestion):
         action=suggestion.action,
         priority=suggestion.priority,
         reason=suggestion.reason,
-        is_applied=suggestion.is_applied,
+        is_applied=suggestion.is_applied or False,
         applied_at=suggestion.applied_at,
-        created_at=suggestion.created_at
+        created_at=suggestion.created_at or datetime.now()
     )
 
 
@@ -105,6 +110,33 @@ def list_change_requests(
     return [_convert_change_request_to_schema(c, db) for c in changes]
 
 
+@router.get("/history", response_model=List[schemas.ChangeHistory])
+def list_change_history(
+    skip: int = 0,
+    limit: int = 100,
+    session_id: Optional[int] = Query(None, description="场次ID"),
+    change_request_id: Optional[int] = Query(None, description="变更申请ID"),
+    db: Session = Depends(get_db)
+):
+    """获取变更历史记录（注意：静态路径必须在 /{change_id} 之前注册）"""
+    histories = crud.get_change_history_list(db, skip=skip, limit=limit,
+                                             session_id=session_id,
+                                             change_request_id=change_request_id)
+    return [_convert_history_to_schema(h) for h in histories]
+
+
+@router.get("/conflicts", response_model=List[schemas.SessionConflict])
+def list_all_conflicts(
+    skip: int = 0,
+    limit: int = 100,
+    status: Optional[RescheduleStatus] = Query(None, description="冲突状态"),
+    db: Session = Depends(get_db)
+):
+    """获取所有冲突列表"""
+    conflicts = crud.get_conflict_list(db, skip=skip, limit=limit, status=status)
+    return [_convert_conflict_to_schema(c) for c in conflicts]
+
+
 @router.get("/{change_id}", response_model=schemas.ChangeRequestWithDetails)
 def get_change_request(change_id: int, db: Session = Depends(get_db)):
     """获取变更申请详情（包含冲突和建议）"""
@@ -130,9 +162,16 @@ def create_change_request(
 ):
     """提交变更申请（学校端发起）
 
-    自动记录变更前后的快照数据，防止重复申请
+    自动记录变更前后的快照数据；提交时即进行多资源预审并暂占新时段资源，
+    任一资源不足返回 409 与可解释的冲突集合，不产生任何部分暂占。
     """
-    change, errors = crud.create_change_request(db, change_in)
+    try:
+        change, errors = crud.create_change_request(db, change_in)
+    except ResourceConflict as exc:
+        raise HTTPException(status_code=409, detail={
+            "message": exc.message,
+            "conflicts": exc.conflicts
+        })
     if not change:
         raise HTTPException(status_code=400, detail={"errors": errors})
     return _convert_change_request_to_schema(change, db)
@@ -179,6 +218,27 @@ def execute_change_request(
     return result
 
 
+@router.post("/{change_id}/cancel", response_model=schemas.ChangeRequestWithDetails)
+def cancel_change_request(
+    change_id: int,
+    operator: str = Body(..., embed=True, description="操作人"),
+    db: Session = Depends(get_db)
+):
+    """取消变更申请：释放其预审资源暂占"""
+    change, errors = crud.cancel_change_request(db, change_id, operator)
+    if not change:
+        raise HTTPException(status_code=400, detail={"errors": errors})
+
+    base = _convert_change_request_to_schema(change, db)
+    conflicts = [_convert_conflict_to_schema(c) for c in change.conflicts]
+    suggestions = [_convert_suggestion_to_schema(s) for s in change.reschedule_suggestions]
+    return schemas.ChangeRequestWithDetails(
+        **base.model_dump(),
+        conflicts=conflicts,
+        suggestions=suggestions
+    )
+
+
 @router.get("/{change_id}/conflicts", response_model=List[schemas.SessionConflict])
 def list_conflicts(
     change_id: int,
@@ -222,33 +282,6 @@ def apply_suggestion(
     return {"success": True, "message": "建议已应用"}
 
 
-@router.get("/conflicts", response_model=List[schemas.SessionConflict])
-def list_all_conflicts(
-    skip: int = 0,
-    limit: int = 100,
-    status: Optional[RescheduleStatus] = Query(None, description="冲突状态"),
-    db: Session = Depends(get_db)
-):
-    """获取所有冲突列表"""
-    conflicts = crud.get_conflict_list(db, skip=skip, limit=limit, status=status)
-    return [_convert_conflict_to_schema(c) for c in conflicts]
-
-
-@router.get("/history", response_model=List[schemas.ChangeHistory])
-def list_change_history(
-    skip: int = 0,
-    limit: int = 100,
-    session_id: Optional[int] = Query(None, description="场次ID"),
-    change_request_id: Optional[int] = Query(None, description="变更申请ID"),
-    db: Session = Depends(get_db)
-):
-    """获取变更历史记录"""
-    histories = crud.get_change_history_list(db, skip=skip, limit=limit,
-                                             session_id=session_id,
-                                             change_request_id=change_request_id)
-    return [_convert_history_to_schema(h) for h in histories]
-
-
 @router.post("/{session_id}/check-conflicts", response_model=schemas.ConflictCheckResult)
 def pre_check_conflicts(
     session_id: int,
@@ -259,7 +292,6 @@ def pre_check_conflicts(
     db: Session = Depends(get_db)
 ):
     """预检查变更可能产生的冲突（提交前预览）"""
-    from datetime import datetime
     from app.models import ChangeRequest, ChangeType
 
     session = crud.get_session(db, session_id)
@@ -291,6 +323,19 @@ def pre_check_conflicts(
     conflict_schemas = [_convert_conflict_to_schema(c) for c in conflicts]
     suggestion_schemas = [_convert_suggestion_to_schema(s) for s in suggestions]
 
+    # 多资源可用性预审（不落库、不暂占）
+    preview_start = datetime.fromisoformat(new_start_time) if new_start_time else session.start_time
+    preview_end = datetime.fromisoformat(new_end_time) if new_end_time else session.end_time
+    requirements = resource_holds.build_session_requirements(
+        db, session.venue_id, session.theme_id,
+        device_quantity=session.device_sets_needed or 1
+    )
+    _, resource_conflicts = resource_holds.check_availability(
+        db, requirements, preview_start, preview_end,
+        exclude_session_id=session.id
+    )
+    db.rollback()  # check_availability 可能幂等创建了资源池台账，预览不保留
+
     summary_parts = []
     time_conflicts = sum(1 for c in conflicts if c.conflict_type.value == "时间冲突")
     shortage_conflicts = sum(1 for c in conflicts if c.conflict_type.value == "人员不足")
@@ -299,7 +344,9 @@ def pre_check_conflicts(
         summary_parts.append(f"检测到 {time_conflicts} 个时间冲突")
     if shortage_conflicts > 0:
         summary_parts.append(f"检测到 {shortage_conflicts} 个人员缺口")
-    if not conflicts:
+    if resource_conflicts:
+        summary_parts.append(f"检测到 {len(resource_conflicts)} 项资源不足")
+    if not conflicts and not resource_conflicts:
         summary_parts.append("未检测到冲突")
     if suggestions:
         summary_parts.append(f"生成 {len(suggestions)} 条重排建议")
@@ -307,8 +354,9 @@ def pre_check_conflicts(
     summary = "，".join(summary_parts)
 
     return schemas.ConflictCheckResult(
-        has_conflicts=len(conflicts) > 0,
+        has_conflicts=bool(conflicts or resource_conflicts),
         conflicts=conflict_schemas,
+        resource_conflicts=resource_conflicts,
         suggestions=suggestion_schemas,
         summary=summary
     )

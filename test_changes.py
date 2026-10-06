@@ -20,10 +20,20 @@ response = requests.post(f"{BASE_URL}/api/themes", json=theme_data)
 theme_id = response.json()["id"] if response.status_code == 200 else 1
 print(f"创建主题: 状态码={response.status_code}, ID={theme_id}")
 
+theme2_data = {"name": "楚汉文化", "description": "楚汉历史与文化", "category": "历史"}
+response = requests.post(f"{BASE_URL}/api/themes", json=theme2_data)
+theme2_id = response.json()["id"] if response.status_code == 200 else 2
+print(f"创建主题2: 状态码={response.status_code}, ID={theme2_id}")
+
 venue_data = {"name": "青铜馆", "venue_type": "展厅", "capacity": 50, "location": "1楼"}
 response = requests.post(f"{BASE_URL}/api/venues", json=venue_data)
 venue_id = response.json()["id"] if response.status_code == 200 else 1
 print(f"创建场地: 状态码={response.status_code}, ID={venue_id}")
+
+venue2_data = {"name": "历史馆", "venue_type": "展厅", "capacity": 40, "location": "2楼"}
+response = requests.post(f"{BASE_URL}/api/venues", json=venue2_data)
+venue2_id = response.json()["id"] if response.status_code == 200 else 2
+print(f"创建场地2: 状态码={response.status_code}, ID={venue2_id}")
 
 school_data = {"name": "实验小学", "contact_person": "王老师", "phone": "13800138000"}
 response = requests.post(f"{BASE_URL}/api/schools", json=school_data)
@@ -35,8 +45,14 @@ staff_data = {
     "staff_type": "讲解员",
     "phone": "13900139000",
     "email": "zhang@example.com",
-    "themes": [{"theme_id": theme_id, "proficiency_level": 5}],
-    "venues": [{"venue_id": venue_id, "is_certified": True}]
+    "themes": [
+        {"theme_id": theme_id, "proficiency_level": 5},
+        {"theme_id": theme2_id, "proficiency_level": 4},
+    ],
+    "venues": [
+        {"venue_id": venue_id, "is_certified": True},
+        {"venue_id": venue2_id, "is_certified": True},
+    ]
 }
 response = requests.post(f"{BASE_URL}/api/staff", json=staff_data)
 staff1_id = response.json()["id"] if response.status_code == 200 else 1
@@ -47,8 +63,14 @@ staff_data2 = {
     "staff_type": "讲解员",
     "phone": "13900139001",
     "email": "li@example.com",
-    "themes": [{"theme_id": theme_id, "proficiency_level": 4}],
-    "venues": [{"venue_id": venue_id, "is_certified": True}]
+    "themes": [
+        {"theme_id": theme_id, "proficiency_level": 4},
+        {"theme_id": theme2_id, "proficiency_level": 4},
+    ],
+    "venues": [
+        {"venue_id": venue_id, "is_certified": True},
+        {"venue_id": venue2_id, "is_certified": True},
+    ]
 }
 response = requests.post(f"{BASE_URL}/api/staff", json=staff_data2)
 staff2_id = response.json()["id"] if response.status_code == 200 else 2
@@ -87,8 +109,8 @@ new_end = tomorrow.replace(hour=16, minute=0).isoformat()
 
 conflict_session = {
     "title": "冲突场次",
-    "theme_id": theme_id,
-    "venue_id": venue_id,
+    "theme_id": theme2_id,
+    "venue_id": venue2_id,
     "session_type": "研学实践",
     "start_time": new_start,
     "end_time": new_end,

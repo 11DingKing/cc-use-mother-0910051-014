@@ -4,6 +4,7 @@ from sqlalchemy import and_
 import random
 
 from app.database import engine, SessionLocal, Base
+from app.migrations import run_migrations
 from app.models import (
     Staff, Theme, Venue, StaffTheme, StaffVenue, School,
     Session, Assignment, Review, LevelBadge,
@@ -14,6 +15,7 @@ from app.crud import is_session_fully_staffed
 
 def seed_database():
     Base.metadata.create_all(bind=engine)
+    run_migrations()
     db = SessionLocal()
     try:
         if db.query(Theme).count() > 0:
@@ -396,6 +398,25 @@ def seed_database():
 
             if is_session_fully_staffed(db, session.id):
                 session.status = SessionStatus.SCHEDULED
+
+        # 为未来场次补齐已确认的资源暂占（展厅/无线设备/主题教具各1）
+        from datetime import datetime as _datetime
+        from app.services import resource_holds
+        from app.services.resource_holds import HoldPurpose
+        db.flush()
+        for sess in sessions:
+            if sess.end_time <= _datetime.now():
+                continue
+            reqs = resource_holds.build_session_requirements(
+                db, sess.venue_id, sess.theme_id,
+                device_quantity=sess.device_sets_needed or 1
+            )
+            gid = resource_holds.acquire_holds(
+                db, reqs, sess.start_time, sess.end_time,
+                purpose=HoldPurpose.DRAFT, ttl_seconds=365 * 86400,
+                session_id=sess.id,
+            )
+            resource_holds.confirm_holds(db, gid)
 
         for session in completed_sessions:
             used_staff = set()

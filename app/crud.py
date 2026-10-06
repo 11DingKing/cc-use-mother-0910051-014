@@ -14,6 +14,13 @@ from app.models import (
 )
 from app import schemas
 from app.config import settings
+from app.services import resource_holds
+from app.services.resource_holds import (
+    ResourceConflict, HoldRequirement, HoldPurpose,
+    acquire_holds, release_holds, release_owner_holds,
+    confirm_holds, swap_holds,
+    get_active_hold_group,
+)
 
 
 def _check_time_overlap(start1: datetime, end1: datetime, start2: datetime, end2: datetime) -> bool:
@@ -115,6 +122,12 @@ def get_theme_list(db: Session, skip: int = 0, limit: int = 100) -> List[Theme]:
 def create_theme(db: Session, theme_in: schemas.ThemeCreate) -> Theme:
     db_theme = Theme(**theme_in.model_dump())
     db.add(db_theme)
+    db.flush()
+    # 即时登记主题教具资源池（容量1）
+    resource_holds.get_or_create_pool(db, HoldRequirement(
+        resource_holds.ResourceType.TEACHING_KIT, 1, db_theme.id,
+        f"{db_theme.name}教具套装"
+    ))
     db.commit()
     db.refresh(db_theme)
     return db_theme
@@ -131,6 +144,11 @@ def get_venue_list(db: Session, skip: int = 0, limit: int = 100) -> List[Venue]:
 def create_venue(db: Session, venue_in: schemas.VenueCreate) -> Venue:
     db_venue = Venue(**venue_in.model_dump())
     db.add(db_venue)
+    db.flush()
+    # 即时登记展厅资源池（每个展厅容量1，同一时段只能有一个场次）
+    resource_holds.get_or_create_pool(db, HoldRequirement(
+        resource_holds.ResourceType.VENUE, 1, db_venue.id, db_venue.name
+    ))
     db.commit()
     db.refresh(db_venue)
     return db_venue
@@ -285,16 +303,46 @@ def get_session_list(db: Session, skip: int = 0, limit: int = 100,
     return query.order_by(Session.start_time).offset(skip).limit(limit).all()
 
 
-def create_session(db: Session, session_in: schemas.SessionCreate) -> Session:
+def create_session(db: Session, session_in: schemas.SessionCreate):
+    """创建草稿场次并原子暂占展厅、无线设备套装、主题教具。
+
+    场次行与暂占在同一事务内提交：任一资源不足时整体回滚，
+    既不会产生孤儿场次，也不会先占住其它资源。
+    """
+    start_time = session_in.start_time
+    end_time = session_in.end_time
+    if end_time <= start_time:
+        raise ResourceConflict([{"resource_type": None, "resource_name": None,
+                                 "message": "结束时间必须晚于开始时间"}])
+
+    requirements = resource_holds.build_session_requirements(
+        db, session_in.venue_id, session_in.theme_id,
+        device_quantity=max(1, session_in.device_sets_needed or 1)
+    )
     db_session = Session(**session_in.model_dump())
     db.add(db_session)
-    db.commit()
-    db.refresh(db_session)
-    return db_session
+    db.flush()
+    try:
+        # acquire_holds 在单个写事务内先全量校验再整体写入（同时提交场次行）；
+        # 失败时整体回滚，不留下任何部分占用
+        acquire_holds(
+            db, requirements, start_time, end_time,
+            purpose=HoldPurpose.DRAFT,
+            ttl_seconds=settings.DRAFT_HOLD_TTL_SECONDS,
+            session_id=db_session.id,
+        )
+        db.refresh(db_session)
+        return db_session
+    except ResourceConflict:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise
 
 
 def update_session(db: Session, session_id: int,
-                   session_in: schemas.SessionUpdate) -> Tuple[Optional[Session], List[str]]:
+                   session_in: schemas.SessionUpdate):
     db_session = get_session(db, session_id)
     if not db_session:
         return None, ["场次不存在"]
@@ -304,6 +352,9 @@ def update_session(db: Session, session_id: int,
     old_guides_needed = db_session.guides_needed
     old_needs_lecturer = db_session.needs_lecturer
     old_status = db_session.status
+    old_venue_id = db_session.venue_id
+    old_theme_id = db_session.theme_id
+    old_device_count = db_session.device_sets_needed or 1
 
     update_data = session_in.model_dump(exclude_unset=True)
 
@@ -315,6 +366,63 @@ def update_session(db: Session, session_id: int,
             if not is_session_fully_staffed(db, session_id):
                 validation_errors.append("人员配置不足，无法标记为已排定状态")
                 del update_data["status"]
+
+    effective_status = update_data.get("status", old_status)
+    new_start = update_data.get("start_time", old_start)
+    new_end = update_data.get("end_time", old_end)
+    new_venue_id = update_data.get("venue_id", old_venue_id)
+    new_theme_id = update_data.get("theme_id", old_theme_id)
+    new_device_count = max(1, update_data.get("device_sets_needed", old_device_count))
+
+    # 取消场次：释放其全部活跃暂占（含待处理变更单的预审暂占，避免泄漏）
+    if effective_status == SessionStatus.CANCELLED and old_status != SessionStatus.CANCELLED:
+        for field, value in update_data.items():
+            setattr(db_session, field, value)
+
+        pending_changes = db.query(ChangeRequest).filter(
+            ChangeRequest.session_id == session_id,
+            ChangeRequest.status.in_([ChangeStatus.PENDING, ChangeStatus.APPROVED])
+        ).all()
+        for pc in pending_changes:
+            owned = _owned_change_group_id(db, pc)
+            if owned:
+                release_holds(db, owned, reason="关联场次取消")
+            pc.status = ChangeStatus.CANCELLED
+
+        db.commit()
+        release_owner_holds(db, session_id=session_id, reason="场次取消")
+        db.refresh(db_session)
+        return db_session, validation_errors
+
+    # 时间/展厅/主题/设备数量任一变化：先验证并锁住新组合，成功后再释放旧组合
+    resource_changed = (
+        new_start != old_start or new_end != old_end
+        or new_venue_id != old_venue_id or new_theme_id != old_theme_id
+        or new_device_count != old_device_count
+    )
+    if resource_changed and new_end > new_start:
+        new_requirements = resource_holds.build_session_requirements(
+            db, new_venue_id, new_theme_id, device_quantity=new_device_count
+        )
+        existing = get_active_hold_group(db, session_id=session_id)
+        if existing:
+            swap_holds(
+                db, new_requirements, new_start, new_end,
+                old_group_id=existing[0].group_id,
+                ttl_seconds=settings.DRAFT_HOLD_TTL_SECONDS,
+                session_id=session_id,
+                # 已排定场次的改期保持确认；草稿改期仍受草稿 TTL 约束
+                confirm=(old_status == SessionStatus.SCHEDULED),
+            )
+        else:
+            # 历史场次（暂占功能上线前创建）没有旧组，直接获取一组
+            group_id = acquire_holds(
+                db, new_requirements, new_start, new_end,
+                purpose=HoldPurpose.DRAFT,
+                ttl_seconds=settings.DRAFT_HOLD_TTL_SECONDS,
+                session_id=session_id,
+            )
+            _ = group_id
 
     for field, value in update_data.items():
         setattr(db_session, field, value)
@@ -338,8 +446,19 @@ def update_session(db: Session, session_id: int,
             if db_session.status == SessionStatus.SCHEDULED:
                 validation_errors.append("人员配置不足，已自动将状态改回草稿")
                 db_session.status = SessionStatus.DRAFT
+                group = get_active_hold_group(db, session_id=session_id)
+                if group:
+                    resource_holds.downgrade_holds_to_held(
+                        db, group[0].group_id, settings.DRAFT_HOLD_TTL_SECONDS
+                    )
             else:
                 validation_errors.append("人员配置不足，需重新核对排班")
+
+    # 直接标记为已排定：确认资源暂占（有效期延至场次结束）
+    if db_session.status == SessionStatus.SCHEDULED and old_status != SessionStatus.SCHEDULED:
+        group = get_active_hold_group(db, session_id=session_id)
+        if group:
+            confirm_holds(db, group[0].group_id)
 
     db.commit()
     db.refresh(db_session)
@@ -364,6 +483,10 @@ def create_assignment(db: Session, session_id: int,
     session = db.query(Session).filter(Session.id == session_id).first()
     if is_session_fully_staffed(db, session_id) and session.status == SessionStatus.DRAFT:
         session.status = SessionStatus.SCHEDULED
+        # 排定即确认资源暂占：有效期延长至场次结束，不再受草稿 TTL 限制
+        group = get_active_hold_group(db, session_id=session_id)
+        if group:
+            confirm_holds(db, group[0].group_id)
 
     db.commit()
     db.refresh(db_assignment)
@@ -383,6 +506,11 @@ def delete_assignment(db: Session, assignment_id: int) -> Tuple[bool, List[str]]
     if session and session.status == SessionStatus.SCHEDULED:
         if not is_session_fully_staffed(db, session_id):
             session.status = SessionStatus.DRAFT
+            group = get_active_hold_group(db, session_id=session_id)
+            if group:
+                resource_holds.downgrade_holds_to_held(
+                    db, group[0].group_id, settings.DRAFT_HOLD_TTL_SECONDS
+                )
 
     db.commit()
     return True, []
@@ -607,6 +735,52 @@ def create_change_request(db: Session, change_in: schemas.ChangeRequestCreate) -
     db.add(db_change)
     db.flush()
 
+    # 变更预审：按新时间段锁定该组合所需的展厅、设备套装、主题教具。
+    new_start = change_in.new_start_time or session.start_time
+    new_end = change_in.new_end_time or session.end_time
+    time_changed = (change_in.new_start_time is not None or change_in.new_end_time is not None)
+
+    if time_changed and (new_start != session.start_time or new_end != session.end_time):
+        # 时间变更：排除该场次自身已有暂占后，为新时段获取一组独立预审暂占。
+        # 任一资源不足则整单回滚，不会产生半条暂占。
+        requirements = resource_holds.build_session_requirements(
+            db, session.venue_id, session.theme_id,
+            device_quantity=session.device_sets_needed or 1
+        )
+        try:
+            group_id = acquire_holds(
+                db, requirements, new_start, new_end,
+                purpose=HoldPurpose.CHANGE_REVIEW,
+                ttl_seconds=settings.REVIEW_HOLD_TTL_SECONDS,
+                session_id=None,
+                change_request_id=db_change.id,
+                exclude_session_id=session.id,
+            )
+        except ResourceConflict:
+            db.rollback()
+            raise
+        db_change.resource_group_id = group_id
+    else:
+        # 仅人数变更：资源组合与时间段不变，直接借用场次自身已有暂占组，
+        # 不再重复锁定同一份资源。
+        session_group = get_active_hold_group(db, session_id=session.id)
+        if session_group:
+            db_change.resource_group_id = session_group[0].group_id
+        else:
+            # 历史场次（暂占功能上线前创建）补占当前组合
+            requirements = resource_holds.build_session_requirements(
+                db, session.venue_id, session.theme_id,
+                device_quantity=session.device_sets_needed or 1
+            )
+            group_id = acquire_holds(
+                db, requirements, session.start_time, session.end_time,
+                purpose=HoldPurpose.CHANGE_REVIEW,
+                ttl_seconds=settings.REVIEW_HOLD_TTL_SECONDS,
+                session_id=None,
+                change_request_id=db_change.id,
+            )
+            db_change.resource_group_id = group_id
+
     create_change_history(db, schemas.ChangeHistoryCreate(
         session_id=change_in.session_id,
         operator=change_in.requester,
@@ -619,6 +793,51 @@ def create_change_request(db: Session, change_in: schemas.ChangeRequestCreate) -
     db.commit()
     db.refresh(db_change)
     return db_change, []
+
+
+def _owned_change_group_id(db: Session, change: ChangeRequest) -> Optional[str]:
+    """返回变更单“自己获取”的预审暂占组ID；借用场次暂占的纯人数变更返回 None。"""
+    if not change.resource_group_id:
+        return None
+    rows = db.query(resource_holds.ResourceHold).filter(
+        resource_holds.ResourceHold.group_id == change.resource_group_id,
+        resource_holds.ResourceHold.status.in_(resource_holds.ACTIVE_STATUSES),
+    ).all()
+    if not rows:
+        return None
+    # 该组确实由变更预审持有（change_request_id 指向本单）才算自有组
+    if any(r.change_request_id == change.id for r in rows):
+        return change.resource_group_id
+    return None
+
+
+def cancel_change_request(db: Session, change_id: int,
+                          operator: str) -> Tuple[Optional[ChangeRequest], List[str]]:
+    """取消变更申请：仅在待审核/已通过状态可取消；
+    释放该变更自有的预审暂占（借用场次的纯人数变更不动场次暂占）。"""
+    change = get_change_request(db, change_id)
+    if not change:
+        return None, ["变更申请不存在"]
+    if change.status not in (ChangeStatus.PENDING, ChangeStatus.APPROVED):
+        return None, [f"当前状态为{change.status.value}，无法取消"]
+
+    owned_group_id = _owned_change_group_id(db, change)
+    if owned_group_id:
+        release_holds(db, owned_group_id, reason="变更申请取消")
+
+    change.status = ChangeStatus.CANCELLED
+    change.reviewer = operator
+    create_change_history(db, schemas.ChangeHistoryCreate(
+        session_id=change.session_id,
+        operator=operator,
+        action="取消变更申请",
+        change_request_id=change_id,
+        change_type=change.change_type,
+        description="取消变更申请，预审资源暂占已释放"
+    ))
+    db.commit()
+    db.refresh(change)
+    return change, []
 
 
 def get_change_request(db: Session, change_id: int) -> Optional[ChangeRequest]:
@@ -660,6 +879,30 @@ def review_change_request(db: Session, change_id: int,
     change.reviewed_at = func.now()
 
     action = "审核通过" if review_in.status == ChangeStatus.APPROVED else "审核拒绝"
+
+    if review_in.status == ChangeStatus.APPROVED:
+        # 审批通过：确认预审阶段锁定的资源暂占（重复审批幂等）。
+        # 借用场次自身暂占的纯人数变更无需额外确认。
+        owned_group_id = _owned_change_group_id(db, change)
+        if owned_group_id:
+            try:
+                confirm_holds(db, owned_group_id)
+            except ResourceConflict as exc:
+                db.rollback()
+                return None, [exc.message or "暂占已失效"]
+
+        conflicts, suggestions = check_conflicts_and_generate_suggestions(db, change)
+        if conflicts:
+            for conflict in conflicts:
+                db.add(conflict)
+            for suggestion in suggestions:
+                db.add(suggestion)
+    else:
+        # 审批拒绝：仅释放本变更自己获取的预审暂占，借用组不动
+        owned_group_id = _owned_change_group_id(db, change)
+        if owned_group_id:
+            release_holds(db, owned_group_id, reason="变更审核拒绝")
+
     create_change_history(db, schemas.ChangeHistoryCreate(
         session_id=change.session_id,
         operator=review_in.reviewer,
@@ -668,14 +911,6 @@ def review_change_request(db: Session, change_id: int,
         change_type=change.change_type,
         description=f"{action}变更申请，审核意见：{review_in.review_comment or '未填写'}"
     ))
-
-    if review_in.status == ChangeStatus.APPROVED:
-        conflicts, suggestions = check_conflicts_and_generate_suggestions(db, change)
-        if conflicts:
-            for conflict in conflicts:
-                db.add(conflict)
-            for suggestion in suggestions:
-                db.add(suggestion)
 
     db.commit()
     db.refresh(change)
@@ -775,7 +1010,17 @@ def execute_change_request(db: Session, change_id: int, operator: str) -> schema
             errors=["变更申请不存在"]
         )
 
-    if change.status not in [ChangeStatus.APPROVED, ChangeStatus.EXECUTED]:
+    if change.status == ChangeStatus.EXECUTED:
+        # 重复执行幂等：不再重复换组或重排
+        return schemas.ChangeExecuteResult(
+            success=True,
+            message="变更已执行，无需重复执行",
+            applied_suggestions=0,
+            remaining_conflicts=0,
+            errors=[]
+        )
+
+    if change.status not in [ChangeStatus.APPROVED]:
         return schemas.ChangeExecuteResult(
             success=False,
             message="变更申请未通过审核",
@@ -788,6 +1033,40 @@ def execute_change_request(db: Session, change_id: int, operator: str) -> schema
             success=False,
             message="关联场次不存在",
             errors=["关联场次不存在"]
+        )
+    if session.status == SessionStatus.CANCELLED:
+        return schemas.ChangeExecuteResult(
+            success=False,
+            message="关联场次已取消，无法执行变更",
+            errors=["关联场次已取消"]
+        )
+
+    # 资源换组：先确认新组合（预审暂占）仍有效，再释放场次旧组合并提升新组合。
+    # 纯人数变更借用的是场次自身暂占，无需换组；若已失效则按当前时段补占。
+    owned_group_id = _owned_change_group_id(db, change)
+    new_window_end = change.new_end_time or session.end_time
+    try:
+        if owned_group_id:
+            resource_holds.promote_change_holds(
+                db, session.id, owned_group_id, new_expires=new_window_end
+            )
+        elif not get_active_hold_group(db, session_id=session.id):
+            requirements = resource_holds.build_session_requirements(
+                db, session.venue_id, session.theme_id,
+                device_quantity=session.device_sets_needed or 1
+            )
+            acquire_holds(
+                db, requirements, session.start_time, session.end_time,
+                purpose=HoldPurpose.DRAFT,
+                ttl_seconds=settings.DRAFT_HOLD_TTL_SECONDS,
+                session_id=session.id,
+            )
+    except ResourceConflict as exc:
+        db.rollback()
+        return schemas.ChangeExecuteResult(
+            success=False,
+            message="资源暂占已失效，变更执行中止，原组合保持有效",
+            errors=[exc.message] if exc.message else []
         )
 
     errors = []
@@ -867,6 +1146,12 @@ def execute_change_request(db: Session, change_id: int, operator: str) -> schema
     if not is_session_fully_staffed(db, session.id):
         session.status = SessionStatus.DRAFT
         errors.append("人员配置仍不足，已自动将状态改回草稿")
+        # 退回草稿：新组合的暂占同步恢复 HELD 并重新计算草稿 TTL，避免长期占压
+        group = get_active_hold_group(db, session_id=session.id)
+        if group:
+            resource_holds.downgrade_holds_to_held(
+                db, group[0].group_id, settings.DRAFT_HOLD_TTL_SECONDS
+            )
     else:
         session.status = SessionStatus.SCHEDULED
 
@@ -981,10 +1266,12 @@ def apply_suggestion(db: Session, suggestion_id: int, operator: str) -> Tuple[bo
         else:
             errors.extend(errs)
 
-    if is_session_fully_staffed(db, session.id) and session.status == SessionStatus.DRAFT:
-        session.status = SessionStatus.SCHEDULED
-
     if not errors:
+        if is_session_fully_staffed(db, session.id) and session.status == SessionStatus.DRAFT:
+            session.status = SessionStatus.SCHEDULED
+            group = get_active_hold_group(db, session_id=session.id)
+            if group:
+                confirm_holds(db, group[0].group_id)
         db.commit()
         db.refresh(suggestion)
         return True, []

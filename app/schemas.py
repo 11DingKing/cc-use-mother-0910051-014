@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pydantic import BaseModel, Field
 from datetime import datetime
 from typing import Optional, List
@@ -7,7 +9,7 @@ from app.models import (
     StaffType, SessionType, SessionStatus,
     AssignmentRole, AudienceType, WarningType,
     ChangeType, ChangeStatus, ConflictType, RescheduleStatus,
-    PointSourceType
+    PointSourceType, ResourceType, HoldStatus, HoldPurpose
 )
 
 
@@ -192,6 +194,7 @@ class SessionBase(BaseModel):
     school_id: Optional[int] = None
     guides_needed: int = 0
     needs_lecturer: bool = False
+    device_sets_needed: int = 1
     description: Optional[str] = None
 
 
@@ -211,6 +214,7 @@ class SessionUpdate(BaseModel):
     school_id: Optional[int] = None
     guides_needed: Optional[int] = None
     needs_lecturer: Optional[bool] = None
+    device_sets_needed: Optional[int] = None
     description: Optional[str] = None
     status: Optional[SessionStatus] = None
 
@@ -223,6 +227,7 @@ class Session(SessionBase):
     school_name: Optional[str] = None
     assignments: List[Assignment] = []
     is_fully_staffed: bool = False
+    resource_group_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -358,6 +363,7 @@ class ChangeRequest(ChangeRequestBase):
     session_title: Optional[str] = None
     conflict_count: int = 0
     suggestion_count: int = 0
+    resource_group_id: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
 
@@ -455,6 +461,7 @@ class ChangeHistory(ChangeHistoryBase):
 class ConflictCheckResult(BaseModel):
     has_conflicts: bool
     conflicts: List[SessionConflict] = []
+    resource_conflicts: List[ResourceConflictItem] = []
     suggestions: List[RescheduleSuggestion] = []
     summary: str
 
@@ -639,3 +646,106 @@ class StaffPointDetail(StaffRankingItem):
     is_excellent: bool
     positive_review_rate: float
     monthly_points: int = 0
+
+
+# ==================== 多资源统一暂占 ====================
+
+class ResourcePoolBase(BaseModel):
+    resource_type: ResourceType
+    ref_id: Optional[int] = None
+    name: str
+    capacity: int = 1
+
+
+class ResourcePoolUpdate(BaseModel):
+    capacity: Optional[int] = None
+    is_active: Optional[bool] = None
+    name: Optional[str] = None
+
+
+class ResourcePoolSchema(ResourcePoolBase):
+    id: int
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ResourceHoldSchema(BaseModel):
+    id: int
+    group_id: str
+    resource_pool_id: int
+    resource_type: ResourceType
+    resource_name: str
+    session_id: Optional[int] = None
+    change_request_id: Optional[int] = None
+    purpose: HoldPurpose
+    status: HoldStatus
+    quantity: int
+    start_time: datetime
+    end_time: datetime
+    expires_at: datetime
+    created_at: datetime
+    confirmed_at: Optional[datetime] = None
+    released_at: Optional[datetime] = None
+    released_reason: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ResourceHolder(BaseModel):
+    group_id: str
+    session_id: Optional[int] = None
+    session_title: Optional[str] = None
+    change_request_id: Optional[int] = None
+    purpose: str
+    status: str
+    quantity: int
+    start_time: str
+    end_time: str
+
+
+class ResourceConflictItem(BaseModel):
+    resource_type: Optional[str] = None
+    resource_name: Optional[str] = None
+    resource_pool_id: Optional[int] = None
+    required: Optional[int] = None
+    capacity: Optional[int] = None
+    available: Optional[int] = None
+    held_by_others: Optional[int] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    holders: List[ResourceHolder] = []
+    message: str
+
+
+class ResourceAvailability(BaseModel):
+    resource_pool_id: int
+    resource_type: str
+    resource_name: str
+    ref_id: Optional[int] = None
+    capacity: int
+    held: int
+    available: int
+    holders: List[ResourceHolder] = []
+
+
+class ResourcePreviewRequest(BaseModel):
+    venue_id: int
+    theme_id: int
+    start_time: datetime
+    end_time: datetime
+    device_sets_needed: int = 1
+
+
+class ResourcePreviewResult(BaseModel):
+    available: bool
+    conflicts: List[ResourceConflictItem] = []
+    summary: str
+
+
+class SweepResult(BaseModel):
+    expired: int
+    released_past: int

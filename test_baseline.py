@@ -30,3 +30,10 @@ def test_core_workflow(tmp_path: Path) -> None:
     core_dir.mkdir()
     core_output = run_script("test_unit.py", core_dir)
     assert "所有测试通过" in core_output, core_output
+
+
+def test_resource_holds_workflow(tmp_path: Path) -> None:
+    hold_dir = tmp_path / "holds"
+    hold_dir.mkdir()
+    hold_output = run_script("test_resource_holds.py", hold_dir)
+    assert "项检查通过" in hold_output, hold_output

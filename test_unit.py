@@ -29,10 +29,20 @@ def main():
         ))
         print(f"✓ 创建主题: ID={theme.id}, 名称={theme.name}")
 
+        theme2 = crud.create_theme(db, schemas.ThemeCreate(
+            name="楚汉文化", description="楚汉历史与文化", category="历史"
+        ))
+        print(f"✓ 创建主题2: ID={theme2.id}, 名称={theme2.name}")
+
         venue = crud.create_venue(db, schemas.VenueCreate(
             name="青铜馆", venue_type="展厅", capacity=50, location="1楼"
         ))
         print(f"✓ 创建场地: ID={venue.id}, 名称={venue.name}")
+
+        venue2 = crud.create_venue(db, schemas.VenueCreate(
+            name="历史馆", venue_type="展厅", capacity=40, location="2楼"
+        ))
+        print(f"✓ 创建场地2: ID={venue2.id}, 名称={venue2.name}")
 
         school = crud.create_school(db, schemas.SchoolCreate(
             name="实验小学", contact_person="王老师", phone="13800138000"
@@ -41,8 +51,14 @@ def main():
 
         staff1 = crud.create_staff(db, schemas.StaffCreate(
             name="张讲解", staff_type=StaffType.GUIDE, phone="13900139000",
-            themes=[schemas.StaffThemeCreate(theme_id=theme.id, proficiency_level=5)],
-            venues=[schemas.StaffVenueCreate(venue_id=venue.id, is_certified=True)]
+            themes=[
+                schemas.StaffThemeCreate(theme_id=theme.id, proficiency_level=5),
+                schemas.StaffThemeCreate(theme_id=theme2.id, proficiency_level=4),
+            ],
+            venues=[
+                schemas.StaffVenueCreate(venue_id=venue.id, is_certified=True),
+                schemas.StaffVenueCreate(venue_id=venue2.id, is_certified=True),
+            ]
         ))
         print(f"✓ 创建讲解员1: ID={staff1.id}, 名称={staff1.name}")
 
@@ -86,7 +102,7 @@ def main():
         new_end = tomorrow.replace(hour=16, minute=0)
         conflict_session = crud.create_session(db, schemas.SessionCreate(
             title="冲突场次",
-            theme_id=theme.id, venue_id=venue.id,
+            theme_id=theme2.id, venue_id=venue2.id,
             session_type=SessionType.RESEARCH,
             start_time=new_start, end_time=new_end,
             audience_type=AudienceType.SCHOOL,
